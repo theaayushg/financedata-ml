@@ -3,12 +3,21 @@ import websockets
 import json
 import duckdb
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.ensemble import IsolationForest
 
-# ✅ Connect to DuckDB
+# Connect to DuckDB
 conn = duckdb.connect("market_data.duckdb")
 
-# ✅ Create a table if it doesn't exist
+# Keep only the latest 1000 entries (avoid DB bloat)
+conn.execute("""
+DELETE FROM btc_prices WHERE timestamp NOT IN (
+    SELECT timestamp FROM btc_prices ORDER BY timestamp DESC LIMIT 1000
+)
+""")
+
+# Create table if it doesn't exist
 conn.execute("""
 CREATE TABLE IF NOT EXISTS btc_prices (
     price DOUBLE,
@@ -16,84 +25,150 @@ CREATE TABLE IF NOT EXISTS btc_prices (
 )
 """)
 
-# ✅ Train Isolation Forest Model from Real Data (Rolling Window)
+
+# Train Isolation Forest Model (Rolling Window)
 def train_initial_model():
-    """Trains the ML model with real BTC price changes instead of raw prices."""
+    """Trains ML model on BTC price changes."""
     prices = conn.execute("SELECT price FROM btc_prices ORDER BY timestamp DESC LIMIT 750").fetchall()
     
-    if len(prices) < 50:  # If not enough data, use synthetic BTC range
-        print("⚠️ Not enough real data. Using estimated price range for training.")
+    if len(prices) < 50:
+        print("⚠️ Not enough real data. Using synthetic training data.")
         price_data = np.random.normal(95500, 500, 500).reshape(-1, 1)
     else:
-        print(f"✅ Training model on {len(prices)} real BTC prices.")
+        print(f"✅ Training model on {len(prices)} BTC prices.")
         price_data = np.array(prices).reshape(-1, 1)
-        price_changes = np.diff(price_data, axis=0)  # Track price deltas
-
-        # If changes are empty, fall back to price values
+        price_changes = np.diff(price_data, axis=0)
         if len(price_changes) < 10:
-            price_changes = price_data
+            price_changes = price_data  # Default to price values if deltas are insufficient
 
-    model = IsolationForest(n_estimators=100, contamination=0.02)  # Lower contamination for fewer false positives
+    model = IsolationForest(n_estimators=100, contamination=0.02)
     model.fit(price_changes)
     return model
 
-# ✅ Initialize Model
+
+# Initialize Model
 model = train_initial_model()
 
+
+# Detect Anomalies
 def detect_anomaly(price):
-    """Detects anomalies based on price changes instead of raw prices."""
+    """Detects anomalies based on price changes."""
     latest_prices = conn.execute("SELECT price FROM btc_prices ORDER BY timestamp DESC LIMIT 2").fetchall()
-    
     if len(latest_prices) < 2:
-        return False  # Not enough data for comparison
+        return False
 
     prev_price = latest_prices[1][0]
-    price_change = price - prev_price  # Calculate difference
-
-    prediction = model.predict([[price_change]])  # Predict based on price movement
+    price_change = price - prev_price
+    prediction = model.predict([[price_change]])
     return prediction[0] == -1  # True if anomaly detected
 
-# ✅ Function to store BTC price in DuckDB
+# Store BTC Price
 def store_price(price):
     conn.execute("INSERT INTO btc_prices (price) VALUES (?)", (price,))
     print(f"Stored BTC Price: {price}")
 
-# ✅ Function to analyze BTC price trend
-def get_price_trend():
-    """Calculate BTC price change over the last 10 prices."""
-    prices = conn.execute("SELECT price FROM btc_prices ORDER BY timestamp DESC LIMIT 10").fetchall()
+
+# Compute Moving Averages
+def compute_moving_averages():
+    """Calculates SMA (10, 50) and EMA (10, 50)."""
+    prices = conn.execute("SELECT price FROM btc_prices ORDER BY timestamp DESC LIMIT 200").fetchall()
+    if len(prices) < 50:
+        return "⚠️ Not enough data for moving averages."
+
+    df = pd.DataFrame(prices, columns=["price"])
+    df["SMA_10"] = df["price"].rolling(window=10).mean()
+    df["SMA_50"] = df["price"].rolling(window=50).mean()
+    df["EMA_10"] = df["price"].ewm(span=10, adjust=False).mean()
+    df["EMA_50"] = df["price"].ewm(span=50, adjust=False).mean()
+
+    return df
+
+
+# Compute Volatility
+def compute_volatility():
+    """Computes rolling standard deviation over last 50 prices."""
+    prices = conn.execute("SELECT price FROM btc_prices ORDER BY timestamp DESC LIMIT 50").fetchall()
+    if len(prices) < 10:
+        return "⚠️ Not enough data for volatility calculation."
+
+    df = pd.DataFrame(prices, columns=["price"])
+    volatility = df["price"].rolling(window=10).std().iloc[-1]
+    return f"📉 BTC Volatility (10-period rolling): {volatility:.2f}"
+
+
+# Compute Relative Strength Index (RSI)
+def compute_rsi():
+    """Calculates 14-period RSI."""
+    prices = conn.execute("SELECT price FROM btc_prices ORDER BY timestamp DESC LIMIT 200").fetchall()
+    if len(prices) < 14:
+        return "⚠️ Not enough data for RSI calculation."
+
+    df = pd.DataFrame(prices, columns=["price"])
+    df["change"] = df["price"].diff()
+    df["gain"] = np.where(df["change"] > 0, df["change"], 0)
+    df["loss"] = np.where(df["change"] < 0, abs(df["change"]), 0)
+
+    avg_gain = df["gain"].rolling(window=14).mean()
+    avg_loss = df["loss"].rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    return f"📈 BTC RSI (14-period): {df['RSI'].iloc[-1]:.2f}"
+
+
+# Compute Bollinger Bands
+def compute_bollinger_bands():
+    """Calculates Bollinger Bands (20-period SMA, ±2 std deviations)."""
+    prices = conn.execute("SELECT price FROM btc_prices ORDER BY timestamp DESC LIMIT 200").fetchall()
+    if len(prices) < 20:
+        return "⚠️ Not enough data for Bollinger Bands."
+
+    df = pd.DataFrame(prices, columns=["price"])
+    df["SMA_20"] = df["price"].rolling(window=20).mean()
+    df["Upper_Band"] = df["SMA_20"] + (df["price"].rolling(window=20).std() * 2)
+    df["Lower_Band"] = df["SMA_20"] - (df["price"].rolling(window=20).std() * 2)
+
+    return df
+
+
+# Compute Sharpe Ratio
+def compute_sharpe_ratio():
+    """Calculates Sharpe Ratio for BTC price changes."""
+    prices = conn.execute("SELECT price FROM btc_prices ORDER BY timestamp DESC LIMIT 100").fetchall()
+    if len(prices) < 20:
+        return "⚠️ Not enough data for Sharpe Ratio."
+
+    df = pd.DataFrame(prices, columns=["price"])
+    df["returns"] = df["price"].pct_change()
     
-    if len(prices) < 2:
-        return "Not enough data for trend analysis."
+    mean_return = df["returns"].mean()
+    std_dev = df["returns"].std()
+    
+    sharpe_ratio = mean_return / std_dev if std_dev != 0 else 0
+    return f"📊 BTC Sharpe Ratio (100-period): {sharpe_ratio:.2f}"
 
-    latest_price = prices[0][0]
-    previous_price = prices[-1][0]
 
-    percent_change = ((latest_price - previous_price) / previous_price) * 100
-    return f"BTC price changed by {percent_change:.2f}% in last 10 updates."
-
-# ✅ Function to Retrain ML Model Every 100 Price Updates
+# Function to Retrain ML Model
 def retrain_model():
-    """Retrains the Isolation Forest model with real BTC price changes."""
+    """Retrains ML model on new BTC price data."""
     prices = conn.execute("SELECT price FROM btc_prices ORDER BY timestamp DESC LIMIT 500").fetchall()
-    
-    if len(prices) < 50:  # Needs at least 50 prices to train
+    if len(prices) < 50:
         print("⚠️ Not enough real data for retraining.")
         return
 
     new_data = np.array(prices).reshape(-1, 1)
-    price_changes = np.diff(new_data, axis=0)  # Compute changes in price
-    
+    price_changes = np.diff(new_data, axis=0)
     if len(price_changes) < 10:
-        price_changes = new_data  # Use price values if changes aren't enough
+        price_changes = new_data
 
     global model
     model = IsolationForest(n_estimators=100, contamination=0.02)
     model.fit(price_changes)
     print(f"🔄 Model retrained on {len(prices)} BTC price changes.")
 
-# ✅ Coinbase WebSocket API to Fetch Live BTC Prices
-price_counter = 0  # Track number of updates for retraining
+
+# Coinbase WebSocket API to Fetch Live BTC Prices
+price_counter = 0
 
 async def fetch_coinbase_data():
     global price_counter
@@ -111,20 +186,17 @@ async def fetch_coinbase_data():
 
             if "price" in trade:
                 price = float(trade["price"])
-
-                # ✅ Store in DuckDB
                 store_price(price)
                 price_counter += 1
 
-                # ✅ Retrain ML model every 100 price updates
+                # Retrain every 100 price updates
                 if price_counter % 100 == 0:
                     retrain_model()
 
-                # ✅ Detect anomalies
-                is_anomaly = detect_anomaly(price)
-                if is_anomaly:
-                    print(f"🚨 Anomaly Detected: BTC Price {price}")
-                else:
-                    print(f"✅ Normal Price: {price}")
+                # Display Quant Indicators
+                print(detect_anomaly(price))
+                print(compute_volatility())
+                print(compute_rsi())
+                print(compute_sharpe_ratio())
 
 asyncio.run(fetch_coinbase_data())
